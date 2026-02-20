@@ -5,34 +5,40 @@ from typing import Any, cast
 
 import numpy as np
 import pandas as pd
-import streamlit as st
 import pydeck as pdk
+import streamlit as st
 
+from anomaly_detection import detect_anomalies
 from data_fetcher import fetch_live_adsb_data
+from data_processing import process_adsb_data
 from data_simulation import (
     generate_aircraft_data,
-    inject_teleportation_attack,
     inject_ghost_aircraft_attack,
     inject_gps_spoofing_attack,
+    inject_teleportation_attack,
 )
-from data_processing import process_adsb_data
-from anomaly_detection import detect_anomalies
 
 # Optional ML
 try:
-    from ml_pipeline import train_lstm_autoencoder, load_artifacts, score_sequences
+    from ml_pipeline import load_artifacts, score_sequences, train_lstm_autoencoder
+
     ML_AVAILABLE = True
     ML_IMPORT_ERROR = None
 except Exception as e:
     ML_AVAILABLE = False
     ML_IMPORT_ERROR = repr(e)
 
-# ---- .env loading WITHOUT python-dotenv dependency ----
+
+# ---- .env loading (force override) ----
 def _load_env_local() -> None:
-    here = os.path.dirname(__file__)
-    env_path = os.path.join(here, ".env")
+    """
+    Loads .env from the SAME DIRECTORY as this app.py file.
+    Force-overrides any existing env vars to avoid stale/empty values.
+    """
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
     if not os.path.exists(env_path):
         return
+
     try:
         with open(env_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -42,9 +48,10 @@ def _load_env_local() -> None:
                 k, v = s.split("=", 1)
                 k = k.strip()
                 v = v.strip().strip('"').strip("'")
-                os.environ.setdefault(k, v)
+                os.environ[k] = v  # IMPORTANT: force override
     except Exception:
         pass
+
 
 _load_env_local()
 
@@ -71,15 +78,22 @@ def _ensure_state() -> None:
     st.session_state.setdefault("attack_window", None)
     st.session_state.setdefault("last_live_epoch", 0)
 
+
 _ensure_state()
 
 
 def _standardize_raw(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalizes either OpenSky state vectors or simulator output into:
+      icao, timestamp (int), latitude, longitude, velocity (m/s),
+      heading (deg), baro_altitude (m), vertical_rate (m/s)
+    """
     if df is None or df.empty:
         return pd.DataFrame()
+
     d = df.copy()
 
-    # normalize column names
+    # OpenSky -> internal names
     if "icao24" in d.columns and "icao" not in d.columns:
         d = d.rename(columns={"icao24": "icao"})
     if "lat" in d.columns and "latitude" not in d.columns:
@@ -89,7 +103,7 @@ def _standardize_raw(df: pd.DataFrame) -> pd.DataFrame:
     if "true_track" in d.columns and "heading" not in d.columns:
         d = d.rename(columns={"true_track": "heading"})
 
-    # timestamps
+    # timestamp
     if "timestamp" not in d.columns:
         if "last_contact" in d.columns:
             d["timestamp"] = d["last_contact"]
@@ -98,7 +112,7 @@ def _standardize_raw(df: pd.DataFrame) -> pd.DataFrame:
         else:
             d["timestamp"] = np.nan
 
-    # additional common names
+    # legacy aliases
     if "altitude" in d.columns and "baro_altitude" not in d.columns:
         d = d.rename(columns={"altitude": "baro_altitude"})
     if "speed" in d.columns and "velocity" not in d.columns:
@@ -113,17 +127,16 @@ def _standardize_raw(df: pd.DataFrame) -> pd.DataFrame:
     d = d[(d["latitude"].between(-90, 90)) & (d["longitude"].between(-180, 180))].copy()
     d["timestamp"] = d["timestamp"].astype(int)
 
-    # ensure optional cols exist
+    # ensure optional columns exist
     for c in ["velocity", "baro_altitude", "heading", "vertical_rate"]:
         if c not in d.columns:
             d[c] = 0.0
         d[c] = d[c].fillna(0.0)
 
-    # If your simulator ever outputs knots/feet using "speed"/"altitude", convert to SI.
-    # Your current simulator is SI already, so this typically does nothing.
+    # If an older simulator format used knots/feet labels, convert to SI.
     is_sim_like = ("speed" in df.columns) or ("altitude" in df.columns)
     if is_sim_like:
-        d["velocity"] = d["velocity"] * 0.514444   # kt -> m/s
+        d["velocity"] = d["velocity"] * 0.514444  # knots -> m/s
         d["baro_altitude"] = d["baro_altitude"] * 0.3048  # ft -> m
 
     return d
@@ -144,8 +157,6 @@ with st.sidebar:
 
     st.divider()
     st.header("Map Display")
-
-    map_style_choice = st.selectbox("Basemap", ["Light (recommended)", "Satellite"], index=0)
     point_size = st.slider("Point size", 400, 4000, 2000, 200)
     point_opacity = st.slider("Point opacity", 50, 255, 235, 5)
 
@@ -170,11 +181,15 @@ with st.sidebar:
         auto_refresh = st.toggle("Auto refresh", value=False)
 
     st.divider()
+
     train_clicked = False
     if mode == "ML (LSTM)" and ML_AVAILABLE:
         train_clicked = st.button("Train / Retrain LSTM")
 
     run_clicked = st.button("Run")
+
+    # Safe to keep as a debug indicator
+    st.caption(f"Mapbox key loaded: {bool(MAPBOX_KEY)}")
 
 
 def run_pipeline() -> None:
@@ -230,13 +245,16 @@ def run_pipeline() -> None:
         if not ML_AVAILABLE:
             st.error("ML unavailable.")
             return
+
         if train_clicked:
             train_lstm_autoencoder(df_proc, seq_len=30, threshold_percentile=99.5, epochs=12)
-            st.success("Trained and saved ML artifacts.")
+            st.success("Model trained and saved.")
+
         arts = load_artifacts()
         if arts is None:
-            st.error("No ML artifacts found. Train first.")
+            st.info("Model hasn’t been trained yet. Use the sidebar to train it.")
             return
+
         scores, anoms = score_sequences(df_proc, arts)
 
     st.session_state["df_raw"] = df_raw
@@ -273,7 +291,7 @@ with tab_overview:
         c1.metric("Rows", f"{len(df_proc):,}")
         c2.metric("Aircraft", f"{df_proc['icao'].nunique():,}")
         c3.metric("Anomalies", f"{len(anoms):,}")
-        c4.metric("Attack Target", attacked or "None")
+        c4.metric("Highlighted", attacked or "None")
 
 with tab_map:
     st.subheader("Map View (High Contrast)")
@@ -287,7 +305,11 @@ with tab_map:
             selected_ts = st.slider("Timestamp", int(ts_vals.min()), int(ts_vals.max()), int(ts_vals.max()), 1)
 
         frame = df_proc[df_proc["timestamp"] == selected_ts].copy()
-        anoms_t = anoms[anoms["timestamp"] == selected_ts].copy() if (not anoms.empty and "timestamp" in anoms.columns) else pd.DataFrame()
+        anoms_t = (
+            anoms[anoms["timestamp"] == selected_ts].copy()
+            if (not anoms.empty and "timestamp" in anoms.columns)
+            else pd.DataFrame()
+        )
 
         if frame.empty:
             st.warning("No points for that timestamp.")
@@ -295,21 +317,21 @@ with tab_map:
             plot = frame[["icao", "latitude", "longitude"]].copy()
             plot["label"] = "Normal"
 
-            # Normal: bright BLUE
-            plot["r"], plot["g"], plot["b"], plot["a"] = 0, 90, 255, int(point_opacity)
+            # Normal: GREEN
+            plot["r"], plot["g"], plot["b"], plot["a"] = 0, 200, 0, int(point_opacity)
 
-            # Anomaly: bright RED
+            # Anomaly: RED
             if not anoms_t.empty and "icao" in anoms_t.columns:
                 bad = set(anoms_t["icao"].astype(str).unique().tolist())
                 m = plot["icao"].astype(str).isin(bad)
                 plot.loc[m, ["r", "g", "b", "a"]] = [255, 0, 0, int(point_opacity)]
                 plot.loc[m, "label"] = "Anomaly"
 
-            # Attacked: ORANGE
+            # Highlighted (attack target in sim): YELLOW
             if attacked:
                 m2 = plot["icao"].astype(str) == str(attacked)
-                plot.loc[m2, ["r", "g", "b", "a"]] = [255, 165, 0, int(point_opacity)]
-                plot.loc[m2, "label"] = "Attacked"
+                plot.loc[m2, ["r", "g", "b", "a"]] = [255, 255, 0, int(point_opacity)]
+                plot.loc[m2, "label"] = "Highlighted"
 
             view = pdk.ViewState(
                 latitude=float(plot["latitude"].mean()),
@@ -330,10 +352,8 @@ with tab_map:
                 line_width_min_pixels=1,
             )
 
-            if map_style_choice.startswith("Satellite"):
-                map_style = "mapbox://styles/mapbox/satellite-streets-v12"
-            else:
-                map_style = "mapbox://styles/mapbox/light-v11"
+            # Fixed Mapbox basemap (no toggle)
+            map_style = "mapbox://styles/mapbox/light-v11"
 
             tooltip_obj: Any = {"text": "{icao}\n{label}"}
             deck = pdk.Deck(
@@ -343,7 +363,7 @@ with tab_map:
                 tooltip=cast(Any, tooltip_obj),
             )
 
-            st.pydeck_chart(deck, use_container_width=True)
+            st.pydeck_chart(deck, width="stretch")
 
 with tab_data:
     st.subheader("Tables")
@@ -357,10 +377,10 @@ with tab_data:
                 st.write("None.")
             else:
                 cols = [c for c in ["timestamp", "icao", "anomaly_type", "anomaly_score"] if c in anoms.columns]
-                st.dataframe(anoms[cols].head(200), use_container_width=True)
+                st.dataframe(anoms[cols].head(200), width="stretch")
         with right:
             st.markdown("**Processed (top 200)**")
-            st.dataframe(df_proc.head(200), use_container_width=True)
+            st.dataframe(df_proc.head(200), width="stretch")
 
 with tab_model:
     st.subheader("Model / ML")
@@ -370,8 +390,9 @@ with tab_model:
     else:
         arts = load_artifacts()
         if arts is None:
-            st.info("No artifacts found. Train in sidebar.")
+            st.info("Model hasn’t been trained yet. Use the sidebar to train it.")
         else:
             st.success(f"Artifacts loaded (seq_len={arts.seq_len}, threshold={arts.threshold:.6f})")
+
         if not scores.empty:
-            st.dataframe(scores.sort_values("anomaly_score", ascending=False).head(200), use_container_width=True)
+            st.dataframe(scores.sort_values("anomaly_score", ascending=False).head(200), width="stretch")

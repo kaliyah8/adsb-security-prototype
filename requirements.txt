@@ -1,0 +1,13 @@
+streamlit
+pandas
+numpy
+
+
+requests
+pydeck
+
+# ML (LSTM autoencoder)
+torch
+scikit-learn
+joblib
+

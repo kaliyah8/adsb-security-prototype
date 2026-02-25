@@ -18,6 +18,8 @@ from data_simulation import (
     inject_teleportation_attack,
 )
 
+from ml_features import build_feature_frame
+
 # Optional ML
 try:
     from ml_pipeline import load_artifacts, score_sequences, train_lstm_autoencoder
@@ -31,10 +33,6 @@ except Exception as e:
 
 # ---- .env loading (force override) ----
 def _load_env_local() -> None:
-    """
-    Loads .env from the SAME DIRECTORY as this app.py file.
-    Force-overrides any existing env vars to avoid stale/empty values.
-    """
     env_path = os.path.join(os.path.dirname(__file__), ".env")
     if not os.path.exists(env_path):
         return
@@ -48,7 +46,7 @@ def _load_env_local() -> None:
                 k, v = s.split("=", 1)
                 k = k.strip()
                 v = v.strip().strip('"').strip("'")
-                os.environ[k] = v  # IMPORTANT: force override
+                os.environ[k] = v
     except Exception:
         pass
 
@@ -61,7 +59,7 @@ if MAPBOX_KEY:
 
 st.set_page_config(page_title="ADS-B Security Monitoring Prototype", layout="wide")
 st.title("ADS-B Security Monitoring Prototype")
-st.caption("Simulated + Live OpenSky snapshot refresh, physics-based detection, optional ML scoring.")
+st.caption("Simulated + Live OpenSky snapshot refresh, physics-based detection, optional ML scoring (quality gated + persistent).")
 
 DEFAULT_VIEW = {"lat": 34.0522, "lon": -118.2437, "zoom": 7, "pitch": 35}
 DEF_LAMIN, DEF_LAMAX = 33.5, 34.5
@@ -72,6 +70,7 @@ LAX_LAT, LAX_LON = 33.9416, -118.4085
 def _ensure_state() -> None:
     st.session_state.setdefault("df_raw", pd.DataFrame())
     st.session_state.setdefault("df_proc", pd.DataFrame())
+    st.session_state.setdefault("df_feat", pd.DataFrame())
     st.session_state.setdefault("anoms", pd.DataFrame())
     st.session_state.setdefault("scores", pd.DataFrame())
     st.session_state.setdefault("attacked", None)
@@ -127,11 +126,11 @@ def _standardize_raw(df: pd.DataFrame) -> pd.DataFrame:
     d = d[(d["latitude"].between(-90, 90)) & (d["longitude"].between(-180, 180))].copy()
     d["timestamp"] = d["timestamp"].astype(int)
 
-    # ensure optional columns exist
+    # ensure optional columns exist (still keep as 0 here, but ML feature builder will track missingness later)
     for c in ["velocity", "baro_altitude", "heading", "vertical_rate"]:
         if c not in d.columns:
-            d[c] = 0.0
-        d[c] = d[c].fillna(0.0)
+            d[c] = np.nan
+        d[c] = pd.to_numeric(d[c], errors="coerce")
 
     # If an older simulator format used knots/feet labels, convert to SI.
     is_sim_like = ("speed" in df.columns) or ("altitude" in df.columns)
@@ -188,7 +187,6 @@ with st.sidebar:
 
     run_clicked = st.button("Run")
 
-    # Safe to keep as a debug indicator
     st.caption(f"Mapbox key loaded: {bool(MAPBOX_KEY)}")
 
 
@@ -225,6 +223,7 @@ def run_pipeline() -> None:
             st.error(err)
             st.session_state["df_raw"] = pd.DataFrame()
             st.session_state["df_proc"] = pd.DataFrame()
+            st.session_state["df_feat"] = pd.DataFrame()
             st.session_state["anoms"] = pd.DataFrame()
             st.session_state["scores"] = pd.DataFrame()
             st.session_state["attacked"] = None
@@ -238,6 +237,9 @@ def run_pipeline() -> None:
 
     df_proc = process_adsb_data(df_raw)
 
+    # Build ML feature frame always (useful for debugging even in physics mode)
+    df_feat = build_feature_frame(df_proc, id_col="icao", ts_col="timestamp", smooth=True, smooth_window=3, impute="median", add_quality=True)
+
     if mode == "Physics Rules":
         anoms = detect_anomalies(df_proc)
         scores = pd.DataFrame()
@@ -247,7 +249,7 @@ def run_pipeline() -> None:
             return
 
         if train_clicked:
-            train_lstm_autoencoder(df_proc, seq_len=30, threshold_percentile=99.5, epochs=12)
+            train_lstm_autoencoder(df_proc, seq_len=30, threshold_percentile=99.5, epochs=12, min_quality=0.7, persistence_k=3, persistence_m=5)
             st.success("Model trained and saved.")
 
         arts = load_artifacts()
@@ -259,6 +261,7 @@ def run_pipeline() -> None:
 
     st.session_state["df_raw"] = df_raw
     st.session_state["df_proc"] = df_proc
+    st.session_state["df_feat"] = df_feat
     st.session_state["anoms"] = anoms if anoms is not None else pd.DataFrame()
     st.session_state["scores"] = scores if scores is not None else pd.DataFrame()
     st.session_state["attacked"] = attacked
@@ -276,6 +279,7 @@ if source == "Live (OpenSky)" and auto_refresh:
 
 
 df_proc = st.session_state.get("df_proc", pd.DataFrame())
+df_feat = st.session_state.get("df_feat", pd.DataFrame())
 anoms = st.session_state.get("anoms", pd.DataFrame())
 scores = st.session_state.get("scores", pd.DataFrame())
 attacked = st.session_state.get("attacked", None)
@@ -352,7 +356,6 @@ with tab_map:
                 line_width_min_pixels=1,
             )
 
-            # Fixed Mapbox basemap (no toggle)
             map_style = "mapbox://styles/mapbox/light-v11"
 
             tooltip_obj: Any = {"text": "{icao}\n{label}"}
@@ -363,7 +366,7 @@ with tab_map:
                 tooltip=cast(Any, tooltip_obj),
             )
 
-            st.pydeck_chart(deck, width="stretch")
+            st.pydeck_chart(deck, use_container_width=True)
 
 with tab_data:
     st.subheader("Tables")
@@ -376,11 +379,11 @@ with tab_data:
             if anoms.empty:
                 st.write("None.")
             else:
-                cols = [c for c in ["timestamp", "icao", "anomaly_type", "anomaly_score"] if c in anoms.columns]
-                st.dataframe(anoms[cols].head(200), width="stretch")
+                cols = [c for c in ["timestamp", "icao", "anomaly_type", "anomaly_score", "anom_count_last_m"] if c in anoms.columns]
+                st.dataframe(anoms[cols].head(200), use_container_width=True)
         with right:
             st.markdown("**Processed (top 200)**")
-            st.dataframe(df_proc.head(200), width="stretch")
+            st.dataframe(df_proc.head(200), use_container_width=True)
 
 with tab_model:
     st.subheader("Model / ML")
@@ -392,7 +395,19 @@ with tab_model:
         if arts is None:
             st.info("Model hasn’t been trained yet. Use the sidebar to train it.")
         else:
-            st.success(f"Artifacts loaded (seq_len={arts.seq_len}, threshold={arts.threshold:.6f})")
+            st.success(
+                f"Artifacts loaded (seq_len={arts.seq_len}, threshold={arts.threshold:.6f}, "
+                f"min_quality={arts.min_quality}, persistence={arts.persistence_k}/{arts.persistence_m})"
+            )
+            st.write("Feature columns:", arts.feature_cols)
+
+        if not df_feat.empty:
+            st.markdown("**Feature / Quality sample (top 50)**")
+            show_cols = [c for c in ["timestamp", "icao", "data_quality_score", "bad_point"] if c in df_feat.columns] + [
+                c for c in df_feat.columns if c in ["implied_speed_mps", "velocity", "accel_mps2", "vert_rate_mps", "turn_rate_dps", "speed_mismatch_mps"]
+            ]
+            st.dataframe(df_feat[show_cols].head(50), use_container_width=True)
 
         if not scores.empty:
-            st.dataframe(scores.sort_values("anomaly_score", ascending=False).head(200), width="stretch")
+            st.markdown("**Sequence scores (top 200 by anomaly_score)**")
+            st.dataframe(scores.sort_values("anomaly_score", ascending=False).head(200), use_container_width=True)

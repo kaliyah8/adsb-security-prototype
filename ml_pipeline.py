@@ -8,12 +8,10 @@ from typing import Optional, Tuple, List, cast
 
 import numpy as np
 import pandas as pd
-
-# sklearn is used for scaling/features (if your project uses it)
 from sklearn.preprocessing import StandardScaler
 
-# torch / model bits (your project already has these modules)
 from lstm_autoencoder import LSTMAutoencoder
+from ml_features import FEATURE_COLS, build_feature_frame
 
 
 ARTIFACT_DIR = "artifacts"
@@ -30,69 +28,24 @@ class Artifacts:
     scaler: StandardScaler
     model: LSTMAutoencoder
 
+    # gating + persistence metadata (for reproducibility)
+    min_quality: float
+    persistence_k: int
+    persistence_m: int
+
 
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
 def _require_df(obj: pd.DataFrame | pd.Series) -> pd.DataFrame:
-    """Force DataFrame type (fixes Pylance unions + prevents accidental Series)."""
     if isinstance(obj, pd.Series):
         return obj.to_frame()
     return obj
 
 
 def _select_cols_df(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    """Always return a DataFrame (never Series)."""
     return df.loc[:, cols].copy()
-
-
-def _make_sequences(df_in: pd.DataFrame, feature_cols: List[str], seq_len: int) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Build sequences per ICAO sorted by timestamp.
-    Returns:
-        X: (N, seq_len, F)
-        keys: (N, 2) with [icao, last_timestamp] for each sequence
-    """
-    df = _require_df(df_in).copy()
-
-    # Enforce required columns
-    for c in ["icao", "timestamp"]:
-        if c not in df.columns:
-            raise ValueError(f"Missing required column: {c}")
-
-    # Ensure all features exist
-    for c in feature_cols:
-        if c not in df.columns:
-            df[c] = 0.0
-
-    df["icao"] = df["icao"].astype(str)
-    df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce").fillna(0).astype(int)
-
-    df = df.sort_values(["icao", "timestamp"]).reset_index(drop=True)
-
-    sequences: List[np.ndarray] = []
-    keys: List[Tuple[str, int]] = []
-
-    for icao, g in df.groupby("icao", sort=False):
-        g = cast(pd.DataFrame, g)  # keep Pylance happy
-        if len(g) < seq_len:
-            continue
-
-        feats = _select_cols_df(g, feature_cols).to_numpy(dtype=np.float32)
-
-        # sliding windows
-        for i in range(seq_len - 1, len(g)):
-            window = feats[i - seq_len + 1 : i + 1]
-            sequences.append(window)
-            keys.append((str(icao), int(g.iloc[i]["timestamp"])))
-
-    if not sequences:
-        return np.zeros((0, seq_len, len(feature_cols)), dtype=np.float32), np.zeros((0, 2), dtype=object)
-
-    X = np.stack(sequences, axis=0)
-    K = np.array(keys, dtype=object)
-    return X, K
 
 
 def _fit_scaler(df_in: pd.DataFrame, feature_cols: List[str]) -> StandardScaler:
@@ -114,43 +67,128 @@ def _transform_with_scaler(df_in: pd.DataFrame, scaler: StandardScaler, feature_
     return out
 
 
-def train_lstm_autoencoder(
+def _make_sequences(
     df_in: pd.DataFrame,
+    feature_cols: List[str],
+    seq_len: int,
+    id_col: str = "icao",
+    ts_col: str = "timestamp",
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Build sequences per aircraft sorted by timestamp.
+    Returns:
+        X: (N, seq_len, F)
+        keys: (N, 2) with [icao, last_timestamp] for each sequence
+    """
+    df = _require_df(df_in).copy()
+
+    for c in [id_col, ts_col]:
+        if c not in df.columns:
+            raise ValueError(f"Missing required column: {c}")
+
+    for c in feature_cols:
+        if c not in df.columns:
+            raise ValueError(f"Missing ML feature column: {c}")
+
+    df[id_col] = df[id_col].astype(str)
+    df[ts_col] = pd.to_numeric(df[ts_col], errors="coerce").fillna(0).astype(int)
+    df = df.sort_values([id_col, ts_col]).reset_index(drop=True)
+
+    sequences: List[np.ndarray] = []
+    keys: List[Tuple[str, int]] = []
+
+    for icao, g in df.groupby(id_col, sort=False):
+        g = cast(pd.DataFrame, g)
+        if len(g) < seq_len:
+            continue
+
+        feats = _select_cols_df(g, feature_cols).to_numpy(dtype=np.float32)
+
+        for i in range(seq_len - 1, len(g)):
+            window = feats[i - seq_len + 1 : i + 1]
+            sequences.append(window)
+            keys.append((str(icao), int(g.iloc[i][ts_col])))
+
+    if not sequences:
+        return np.zeros((0, seq_len, len(feature_cols)), dtype=np.float32), np.zeros((0, 2), dtype=object)
+
+    X = np.stack(sequences, axis=0)
+    K = np.array(keys, dtype=object)
+    return X, K
+
+
+def _time_split(df: pd.DataFrame, ts_col: str = "timestamp", train_frac: float = 0.8) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Simple global time split to avoid training on future data."""
+    d = df.sort_values(ts_col).copy()
+    if len(d) < 10:
+        return d, d.iloc[0:0].copy()
+
+    split_idx = int(len(d) * train_frac)
+    train = d.iloc[:split_idx].copy()
+    val = d.iloc[split_idx:].copy()
+    return train, val
+
+
+def train_lstm_autoencoder(
+    df_proc_in: pd.DataFrame,
+    *,
     seq_len: int = 30,
     threshold_percentile: float = 99.5,
     epochs: int = 12,
     batch_size: int = 64,
     lr: float = 1e-3,
+    min_quality: float = 0.7,
+    persistence_k: int = 3,
+    persistence_m: int = 5,
 ) -> Artifacts:
     """
-    Train LSTM autoencoder on sequences built from df_in.
+    Train LSTM autoencoder on CLEAN, GATED sequences.
     Saves artifacts to ./artifacts.
     """
-    df = _require_df(df_in).copy()
+    df_proc = _require_df(df_proc_in).copy()
 
-    # Feature columns: keep aligned with your data_processing output
-    feature_cols = [c for c in ["speed_mps", "vs_mps", "turn_rate_dps", "accel_mps2"] if c in df.columns]
-    if not feature_cols:
-        # fallback if your processing uses different names
-        feature_cols = [c for c in ["velocity", "vertical_rate", "heading"] if c in df.columns]
-    if not feature_cols:
-        raise ValueError("No usable ML feature columns found in processed dataframe.")
+    # Build robust feature frame (adds data_quality_score, bad_point, etc.)
+    df_feat = build_feature_frame(df_proc, id_col="icao", ts_col="timestamp", smooth=True, smooth_window=3, impute="median", add_quality=True)
+
+    # Quality gating for training
+    if "data_quality_score" in df_feat.columns:
+        df_feat = df_feat[(df_feat["data_quality_score"] >= float(min_quality)) & (df_feat.get("bad_point", 0) == 0)].copy()
+
+    if df_feat.empty:
+        raise ValueError("After quality gating, no data remains for training. Lower min_quality or check preprocessing.")
+
+    feature_cols = list(FEATURE_COLS)
+
+    # Train/val split by time
+    train_df, val_df = _time_split(df_feat, ts_col="timestamp", train_frac=0.8)
+    if val_df.empty:
+        # fallback: if too small, use same for val but warn via threshold percentile still
+        val_df = train_df.copy()
 
     _ensure_dir(ARTIFACT_DIR)
 
-    scaler = _fit_scaler(df, feature_cols)
-    df_scaled = _transform_with_scaler(df, scaler, feature_cols)
+    # Fit scaler on TRAIN ONLY (prevents leakage)
+    scaler = _fit_scaler(train_df, feature_cols)
 
-    X, K = _make_sequences(df_scaled, feature_cols, seq_len)
-    if X.shape[0] == 0:
-        raise ValueError("Not enough data to build sequences for training.")
+    train_scaled = _transform_with_scaler(train_df, scaler, feature_cols)
+    val_scaled = _transform_with_scaler(val_df, scaler, feature_cols)
+
+    X_train, _ = _make_sequences(train_scaled, feature_cols, seq_len, id_col="icao", ts_col="timestamp")
+    if X_train.shape[0] == 0:
+        raise ValueError("Not enough training data to build sequences. Increase data or reduce seq_len.")
 
     # Train model
     model = LSTMAutoencoder(n_features=len(feature_cols), hidden_size=64)
-    model.fit(X, epochs=epochs, batch_size=batch_size, lr=lr)
+    model.fit(X_train, epochs=epochs, batch_size=batch_size, lr=lr)
 
-    # Reconstruction error per sequence -> threshold
-    errs = model.reconstruction_error(X)
+    # Threshold chosen from VALIDATION errors (correct)
+    X_val, _ = _make_sequences(val_scaled, feature_cols, seq_len, id_col="icao", ts_col="timestamp")
+    if X_val.shape[0] == 0:
+        # fallback: use training errors if val too small (still better than crashing)
+        errs = model.reconstruction_error(X_train)
+    else:
+        errs = model.reconstruction_error(X_val)
+
     threshold = float(np.percentile(errs, threshold_percentile))
 
     # Save artifacts
@@ -159,10 +197,29 @@ def train_lstm_autoencoder(
 
     model.save(MODEL_PATH)
 
+    meta = {
+        "seq_len": seq_len,
+        "threshold": threshold,
+        "feature_cols": feature_cols,
+        "min_quality": float(min_quality),
+        "persistence_k": int(persistence_k),
+        "persistence_m": int(persistence_m),
+        "threshold_percentile": float(threshold_percentile),
+        "version": "v2_quality_gated_persistent",
+    }
     with open(META_PATH, "wb") as f:
-        pickle.dump({"seq_len": seq_len, "threshold": threshold, "feature_cols": feature_cols}, f)
+        pickle.dump(meta, f)
 
-    return Artifacts(seq_len=seq_len, threshold=threshold, feature_cols=feature_cols, scaler=scaler, model=model)
+    return Artifacts(
+        seq_len=seq_len,
+        threshold=threshold,
+        feature_cols=feature_cols,
+        scaler=scaler,
+        model=model,
+        min_quality=float(min_quality),
+        persistence_k=int(persistence_k),
+        persistence_m=int(persistence_m),
+    )
 
 
 def load_artifacts() -> Optional[Artifacts]:
@@ -179,31 +236,88 @@ def load_artifacts() -> Optional[Artifacts]:
     seq_len = int(meta["seq_len"])
     threshold = float(meta["threshold"])
 
+    min_quality = float(meta.get("min_quality", 0.7))
+    persistence_k = int(meta.get("persistence_k", 3))
+    persistence_m = int(meta.get("persistence_m", 5))
+
     model = LSTMAutoencoder(n_features=len(feature_cols), hidden_size=64)
     model.load(MODEL_PATH)
 
-    return Artifacts(seq_len=seq_len, threshold=threshold, feature_cols=feature_cols, scaler=scaler, model=model)
+    return Artifacts(
+        seq_len=seq_len,
+        threshold=threshold,
+        feature_cols=feature_cols,
+        scaler=scaler,
+        model=model,
+        min_quality=min_quality,
+        persistence_k=persistence_k,
+        persistence_m=persistence_m,
+    )
 
 
-def score_sequences(df_in: pd.DataFrame, artifacts: Artifacts) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    df = _require_df(df_in).copy()
+def _apply_persistence(scores: pd.DataFrame, k: int, m: int) -> pd.DataFrame:
+    """
+    Add persistence-based alerting:
+    alert if at least k of last m sequences are above threshold (per aircraft).
+    Requires scores columns: icao, timestamp, is_seq_anom
+    """
+    s = scores.sort_values(["icao", "timestamp"]).copy()
+    s["seq_anom_int"] = s["is_seq_anom"].astype(int)
 
-    df_scaled = _transform_with_scaler(df, artifacts.scaler, artifacts.feature_cols)
-    X, K = _make_sequences(df_scaled, artifacts.feature_cols, artifacts.seq_len)
+    # rolling sum of last m
+    s["anom_count_last_m"] = (
+        s.groupby("icao", dropna=False)["seq_anom_int"]
+        .transform(lambda x: x.rolling(window=m, min_periods=1).sum())
+    )
+    s["is_persistent_anom"] = (s["anom_count_last_m"] >= int(k))
+    return s
+
+
+def score_sequences(df_proc_in: pd.DataFrame, artifacts: Artifacts) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Score sequences with quality gating + persistence.
+    Returns:
+      scores: per-sequence table
+      anoms: persistent anomalies table
+    """
+    df_proc = _require_df(df_proc_in).copy()
+
+    # Build feature frame (same as training!)
+    df_feat = build_feature_frame(df_proc, id_col="icao", ts_col="timestamp", smooth=True, smooth_window=3, impute="median", add_quality=True)
+
+    # Quality gating (same as training)
+    if "data_quality_score" in df_feat.columns:
+        df_feat = df_feat[(df_feat["data_quality_score"] >= float(artifacts.min_quality)) & (df_feat.get("bad_point", 0) == 0)].copy()
+
+    if df_feat.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    df_scaled = _transform_with_scaler(df_feat, artifacts.scaler, artifacts.feature_cols)
+    X, K = _make_sequences(df_scaled, artifacts.feature_cols, artifacts.seq_len, id_col="icao", ts_col="timestamp")
 
     if X.shape[0] == 0:
         return pd.DataFrame(), pd.DataFrame()
 
-    errs = artifacts.model.reconstruction_error(X)
+    errs = artifacts.model.reconstruction_error(X).astype(float)
 
     scores = pd.DataFrame(
         {
             "icao": K[:, 0].astype(str),
             "timestamp": K[:, 1].astype(int),
-            "anomaly_score": errs.astype(float),
+            "anomaly_score": errs,
         }
     )
 
-    anoms = scores[scores["anomaly_score"] > artifacts.threshold].copy()
-    anoms["anomaly_type"] = "ML Sequence Anomaly"
+    scores["threshold"] = float(artifacts.threshold)
+    scores["is_seq_anom"] = scores["anomaly_score"] > float(artifacts.threshold)
+
+    # persistence
+    scores = _apply_persistence(scores, artifacts.persistence_k, artifacts.persistence_m)
+
+    # final anomalies are persistent ones
+    anoms = scores[scores["is_persistent_anom"]].copy()
+    anoms["anomaly_type"] = "ML Sequence Anomaly (Persistent)"
+    anoms["persistence_k"] = int(artifacts.persistence_k)
+    anoms["persistence_m"] = int(artifacts.persistence_m)
+
     return scores.sort_values(["timestamp", "icao"]), anoms.sort_values(["timestamp", "icao"])

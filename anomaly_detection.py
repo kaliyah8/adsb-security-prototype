@@ -1,4 +1,3 @@
-# anomaly_detection.py
 import numpy as np
 import pandas as pd
 
@@ -21,6 +20,9 @@ def detect_anomalies(df: pd.DataFrame) -> pd.DataFrame:
     """
     Physics-based anomaly rules (defensible and unit-consistent).
     Returns rows flagged with anomaly_type and anomaly_score.
+
+    Requirements: df must already contain per-aircraft deltas/derived kinematics
+    from process_adsb_data().
     """
     if df is None or df.empty:
         return pd.DataFrame()
@@ -36,12 +38,12 @@ def detect_anomalies(df: pd.DataFrame) -> pd.DataFrame:
 
     d = df.copy()
 
-    # must have prev point
+    # Must have previous point (otherwise no physics deltas)
     d = d[d["has_prev"]].copy()
     if d.empty:
         return pd.DataFrame()
 
-    # quality dt
+    # Only evaluate physics rules where dt is in a sane window
     d = d[(d["delta_t"] >= MIN_DT) & (d["delta_t"] <= MAX_DT)].copy()
     if d.empty:
         return pd.DataFrame()
@@ -82,10 +84,12 @@ def detect_anomalies(df: pd.DataFrame) -> pd.DataFrame:
         a["anomaly_score"] = (a["turn_rate_dps"].abs() - MAX_TURN_DPS).clip(lower=0)
         out.append(a)
 
-    # 5) Spoofing suspected: implied vs reported mismatch, persistent (true consecutive)
+    # 5) Spoofing suspected: implied vs reported mismatch, persistent consecutive
+    # NOTE: This works only when implied_speed is meaningful (needs 2+ points/aircraft)
     d["speed_mismatch_mps"] = (d["implied_speed_mps"] - d["velocity"]).abs()
     d["spoof_hit"] = (d["speed_mismatch_mps"] > SPOOF_MISMATCH_MPS).astype(int)
 
+    # True consecutive hits: rolling sum over last K samples per aircraft
     d["hit_run"] = (
         d.groupby("icao")["spoof_hit"]
         .transform(lambda s: s.rolling(SPOOF_K_CONSEC, min_periods=SPOOF_K_CONSEC).sum())

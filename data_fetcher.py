@@ -1,4 +1,3 @@
-# data_fetcher.py
 import os
 import time
 from typing import Tuple
@@ -85,7 +84,10 @@ def fetch_live_adsb_data(
 
         df["callsign"] = df["callsign"].astype(str).str.strip().replace({"None": ""})
 
-        num_cols = ["lon", "lat", "baro_altitude", "velocity", "true_track", "vertical_rate", "geo_altitude", "last_contact", "time_position"]
+        num_cols = [
+            "lon", "lat", "baro_altitude", "velocity", "true_track", "vertical_rate",
+            "geo_altitude", "last_contact", "time_position"
+        ]
         for c in num_cols:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 

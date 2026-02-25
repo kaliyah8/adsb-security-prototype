@@ -1,11 +1,9 @@
-# lstm_autoencoder.py
 from __future__ import annotations
 
 import os
 from typing import Optional
 
 import numpy as np
-
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -46,12 +44,9 @@ class LSTMAutoencoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, T, F)
         enc_out, (h_n, c_n) = self.encoder(x)  # enc_out: (B, T, H)
-
-        # Decode by feeding zeros with the final hidden state as initial state
         B, T, H = enc_out.shape
         dec_in = torch.zeros((B, T, H), device=x.device, dtype=x.dtype)
-        dec_out, _ = self.decoder(dec_in, (h_n, c_n))  # (B, T, H)
-
+        dec_out, _ = self.decoder(dec_in, (h_n, c_n))
         y = self.output_layer(dec_out)  # (B, T, F)
         return y
 
@@ -75,7 +70,7 @@ class LSTMAutoencoder(nn.Module):
         dl = DataLoader(ds, batch_size=int(batch_size), shuffle=True, drop_last=False)
 
         optimizer = torch.optim.Adam(self.parameters(), lr=float(lr))
-        loss_fn = nn.MSELoss(reduction="mean")  # IMPORTANT: callable, do not shadow
+        loss_fn = nn.MSELoss(reduction="mean")
 
         for _ in range(int(epochs)):
             for (batch,) in dl:
@@ -120,5 +115,4 @@ class LSTMAutoencoder(nn.Module):
 
     def load(self, path: str, map_location: Optional[str] = None) -> None:
         ckpt = torch.load(path, map_location=map_location or "cpu")
-        # NOTE: we assume constructor matches these; if not, rebuild the object.
         self.load_state_dict(ckpt["state_dict"], strict=True)

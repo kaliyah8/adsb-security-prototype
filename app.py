@@ -59,7 +59,10 @@ if MAPBOX_KEY:
 
 st.set_page_config(page_title="ADS-B Security Monitoring Prototype", layout="wide")
 st.title("ADS-B Security Monitoring Prototype")
-st.caption("Simulated + Live OpenSky snapshot refresh, physics-based detection, optional ML scoring (quality gated + persistent).")
+st.caption(
+    "Simulated + Live OpenSky snapshot refresh, physics-based detection, optional ML scoring "
+    "(quality gated + persistent)."
+)
 
 DEFAULT_VIEW = {"lat": 34.0522, "lon": -118.2437, "zoom": 7, "pitch": 35}
 DEF_LAMIN, DEF_LAMAX = 33.5, 34.5
@@ -76,6 +79,9 @@ def _ensure_state() -> None:
     st.session_state.setdefault("attacked", None)
     st.session_state.setdefault("attack_window", None)
     st.session_state.setdefault("last_live_epoch", 0)
+
+    # NEW: rolling history for Live mode so delta_t exists
+    st.session_state.setdefault("df_raw_hist", pd.DataFrame())
 
 
 _ensure_state()
@@ -126,7 +132,7 @@ def _standardize_raw(df: pd.DataFrame) -> pd.DataFrame:
     d = d[(d["latitude"].between(-90, 90)) & (d["longitude"].between(-180, 180))].copy()
     d["timestamp"] = d["timestamp"].astype(int)
 
-    # ensure optional columns exist (still keep as 0 here, but ML feature builder will track missingness later)
+    # ensure optional columns exist
     for c in ["velocity", "baro_altitude", "heading", "vertical_rate"]:
         if c not in d.columns:
             d[c] = np.nan
@@ -179,6 +185,11 @@ with st.sidebar:
         refresh_sec = st.slider("Refresh seconds", 5, 60, 10, 1)
         auto_refresh = st.toggle("Auto refresh", value=False)
 
+        # NEW: ability to reset Live history
+        if st.button("Clear live history"):
+            st.session_state["df_raw_hist"] = pd.DataFrame()
+            st.success("Cleared Live rolling history.")
+
     st.divider()
 
     train_clicked = False
@@ -211,7 +222,14 @@ def run_pipeline() -> None:
             raw = inject_ghost_aircraft_attack(raw, "GHOST1", start_step, end_step)
             attacked, attack_window = "GHOST1", (start_step, end_step)
         elif attack == "GPS Spoofing" and target:
-            raw = inject_gps_spoofing_attack(raw, target, start_step, end_step, lat_shift=lat_shift, lon_shift=lon_shift)
+            raw = inject_gps_spoofing_attack(
+                raw,
+                target,
+                start_step,
+                end_step,
+                lat_shift=lat_shift,
+                lon_shift=lon_shift,
+            )
             attacked, attack_window = target, (start_step, end_step)
 
         df_raw = _standardize_raw(raw)
@@ -229,7 +247,24 @@ def run_pipeline() -> None:
             st.session_state["attacked"] = None
             st.session_state["attack_window"] = None
             return
-        df_raw = _standardize_raw(df_live)
+
+        df_raw_new = _standardize_raw(df_live)
+
+        # NEW: accumulate rolling history so each aircraft has multiple timestamps
+        hist = st.session_state.get("df_raw_hist", pd.DataFrame())
+        df_raw_hist = pd.concat([hist, df_raw_new], ignore_index=True)
+
+        # drop exact duplicates (same aircraft + same timestamp)
+        if not df_raw_hist.empty:
+            df_raw_hist = df_raw_hist.drop_duplicates(subset=["icao", "timestamp"], keep="last")
+
+            # keep last 15 minutes of history (based on newest timestamp)
+            tmax = int(df_raw_hist["timestamp"].max())
+            cutoff = tmax - 15 * 60
+            df_raw_hist = df_raw_hist[df_raw_hist["timestamp"] >= cutoff].copy()
+
+        st.session_state["df_raw_hist"] = df_raw_hist
+        df_raw = df_raw_hist
 
     if df_raw.empty:
         st.error("No data returned.")
@@ -238,7 +273,15 @@ def run_pipeline() -> None:
     df_proc = process_adsb_data(df_raw)
 
     # Build ML feature frame always (useful for debugging even in physics mode)
-    df_feat = build_feature_frame(df_proc, id_col="icao", ts_col="timestamp", smooth=True, smooth_window=3, impute="median", add_quality=True)
+    df_feat = build_feature_frame(
+        df_proc,
+        id_col="icao",
+        ts_col="timestamp",
+        smooth=True,
+        smooth_window=3,
+        impute="median",
+        add_quality=True,
+    )
 
     if mode == "Physics Rules":
         anoms = detect_anomalies(df_proc)
@@ -249,7 +292,15 @@ def run_pipeline() -> None:
             return
 
         if train_clicked:
-            train_lstm_autoencoder(df_proc, seq_len=30, threshold_percentile=99.5, epochs=12, min_quality=0.7, persistence_k=3, persistence_m=5)
+            train_lstm_autoencoder(
+                df_proc,
+                seq_len=30,
+                threshold_percentile=99.5,
+                epochs=12,
+                min_quality=0.7,
+                persistence_k=3,
+                persistence_m=5,
+            )
             st.success("Model trained and saved.")
 
         arts = load_artifacts()
@@ -379,7 +430,11 @@ with tab_data:
             if anoms.empty:
                 st.write("None.")
             else:
-                cols = [c for c in ["timestamp", "icao", "anomaly_type", "anomaly_score", "anom_count_last_m"] if c in anoms.columns]
+                cols = [
+                    c
+                    for c in ["timestamp", "icao", "anomaly_type", "anomaly_score", "anom_count_last_m"]
+                    if c in anoms.columns
+                ]
                 st.dataframe(anoms[cols].head(200), use_container_width=True)
         with right:
             st.markdown("**Processed (top 200)**")
@@ -404,10 +459,61 @@ with tab_model:
         if not df_feat.empty:
             st.markdown("**Feature / Quality sample (top 50)**")
             show_cols = [c for c in ["timestamp", "icao", "data_quality_score", "bad_point"] if c in df_feat.columns] + [
-                c for c in df_feat.columns if c in ["implied_speed_mps", "velocity", "accel_mps2", "vert_rate_mps", "turn_rate_dps", "speed_mismatch_mps"]
+                c
+                for c in df_feat.columns
+                if c
+                in [
+                    "implied_speed_mps",
+                    "velocity",
+                    "accel_mps2",
+                    "vert_rate_mps",
+                    "turn_rate_dps",
+                    "speed_mismatch_mps",
+                ]
             ]
             st.dataframe(df_feat[show_cols].head(50), use_container_width=True)
 
         if not scores.empty:
             st.markdown("**Sequence scores (top 200 by anomaly_score)**")
             st.dataframe(scores.sort_values("anomaly_score", ascending=False).head(200), use_container_width=True)
+
+    # NEW: delta_t stats ALWAYS available (works even without ML)
+    st.markdown("## Timestamp Update Rate (delta_t)")
+
+    if df_proc.empty:
+        st.info("Run the pipeline first.")
+    else:
+        d = df_proc[["icao", "timestamp"]].copy()
+        d["timestamp"] = pd.to_numeric(d["timestamp"], errors="coerce")
+        d = d.dropna(subset=["icao", "timestamp"]).copy()
+        d = d.sort_values(["icao", "timestamp"])
+        d["delta_t"] = d.groupby("icao")["timestamp"].diff()
+
+        dt = d.dropna(subset=["delta_t"]).copy()
+        dt = dt[(dt["delta_t"] > 0) & (dt["delta_t"] < 600)]
+
+        if dt.empty:
+            st.info("No usable delta_t values yet (need at least 2 points per aircraft).")
+        else:
+            top_icaos = dt["icao"].value_counts().head(5).index.tolist()
+
+            rows = []
+            for icao in top_icaos:
+                x = dt.loc[dt["icao"] == icao, "delta_t"].astype(float)
+                rows.append(
+                    {
+                        "icao": icao,
+                        "n_deltas": int(x.shape[0]),
+                        "median_dt_s": float(x.median()),
+                        "p95_dt_s": float(x.quantile(0.95)),
+                        "seq_len_30_seconds_equiv": float(x.median() * 30.0),
+                    }
+                )
+
+            dt_stats = pd.DataFrame(rows).sort_values("median_dt_s")
+            st.dataframe(dt_stats, use_container_width=True)
+
+            global_med = float(dt["delta_t"].median())
+            st.caption(
+                f"Overall median delta_t ≈ {global_med:.2f}s → seq_len=30 ≈ {global_med*30.0:.1f} seconds of behavior."
+            )

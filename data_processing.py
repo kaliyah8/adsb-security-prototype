@@ -1,19 +1,25 @@
-# data_processing.py
 import numpy as np
 import pandas as pd
 from utils import haversine_distance
+
 
 def _wrap_deg(d: float) -> float:
     """Wrap delta heading into [-180, 180]."""
     x = (d + 180.0) % 360.0 - 180.0
     return float(x)
 
+
 def process_adsb_data(df_raw: pd.DataFrame) -> pd.DataFrame:
     """
     Expects standardized columns:
       icao, timestamp (int), latitude, longitude, velocity (m/s), heading (deg),
       baro_altitude (m), vertical_rate (m/s) optional.
+
     Produces per-aircraft deltas and implied kinematics.
+
+    IMPORTANT:
+    - If you feed only one snapshot per aircraft (one timestamp), then has_prev=False and
+      delta features will be NaN. Live mode must accumulate history across refreshes.
     """
     if df_raw is None or df_raw.empty:
         return pd.DataFrame()
@@ -25,23 +31,24 @@ def process_adsb_data(df_raw: pd.DataFrame) -> pd.DataFrame:
         if c not in d.columns:
             raise ValueError(f"Missing required column: {c}")
 
-    # fill optional
+    # fill optional columns (keep NaN rather than forcing 0 too early)
     for c in ["velocity", "heading", "baro_altitude", "vertical_rate"]:
         if c not in d.columns:
-            d[c] = 0.0
+            d[c] = np.nan
 
     d["icao"] = d["icao"].astype(str).str.strip()
-    d["timestamp"] = pd.to_numeric(d["timestamp"], errors="coerce").astype("Int64")
+    d["timestamp"] = pd.to_numeric(d["timestamp"], errors="coerce")
     d["latitude"] = pd.to_numeric(d["latitude"], errors="coerce")
     d["longitude"] = pd.to_numeric(d["longitude"], errors="coerce")
-    d["velocity"] = pd.to_numeric(d["velocity"], errors="coerce").fillna(0.0)
-    d["heading"] = pd.to_numeric(d["heading"], errors="coerce").fillna(0.0)
-    d["baro_altitude"] = pd.to_numeric(d["baro_altitude"], errors="coerce").fillna(0.0)
-    d["vertical_rate"] = pd.to_numeric(d["vertical_rate"], errors="coerce").fillna(0.0)
+    d["velocity"] = pd.to_numeric(d["velocity"], errors="coerce")
+    d["heading"] = pd.to_numeric(d["heading"], errors="coerce")
+    d["baro_altitude"] = pd.to_numeric(d["baro_altitude"], errors="coerce")
+    d["vertical_rate"] = pd.to_numeric(d["vertical_rate"], errors="coerce")
 
     d = d.dropna(subset=["icao", "timestamp", "latitude", "longitude"]).copy()
     d["timestamp"] = d["timestamp"].astype(int)
 
+    # For physics deltas, velocity/heading/alt can be missing; keep NaN and let features handle it.
     d = d.sort_values(["icao", "timestamp"]).reset_index(drop=True)
 
     # previous values per icao
@@ -66,10 +73,10 @@ def process_adsb_data(df_raw: pd.DataFrame) -> pd.DataFrame:
     # implied ground speed (m/s)
     d["implied_speed_mps"] = d["distance_m"] / d["delta_t"]
 
-    # implied acceleration (m/s^2)
+    # implied acceleration (m/s^2) (only where velocity + prev_velocity exist)
     d["accel_mps2"] = (d["velocity"] - d["prev_velocity"]) / d["delta_t"]
 
-    # implied vertical speed (m/s)
+    # implied vertical speed (m/s) (use baro altitude, not vertical_rate)
     d["vert_rate_mps"] = (d["baro_altitude"] - d["prev_altitude"]) / d["delta_t"]
 
     # turn rate (deg/s)

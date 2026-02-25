@@ -1,10 +1,11 @@
-# data_simulation.py
 import numpy as np
 import pandas as pd
 from utils import move_latlon
 
+
 def _rand_icao(i: int) -> str:
     return f"SIM{i:04d}"
+
 
 def generate_aircraft_data(
     num_aircraft: int = 25,
@@ -51,7 +52,6 @@ def generate_aircraft_data(
                 "vertical_rate": float(climb_rate),
             })
 
-            # integrate
             v = max(0.0, v + accel * dt_s + rng.normal(0.0, 0.15))
             heading = (heading + turn_rate * dt_s + rng.normal(0.0, 0.05)) % 360.0
             alt = max(0.0, alt + climb_rate * dt_s + rng.normal(0.0, 0.2))

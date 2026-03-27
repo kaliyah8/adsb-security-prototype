@@ -19,6 +19,9 @@ def generate_aircraft_data(
     Physically consistent simulator in SI units:
       velocity: m/s, altitude: m, vertical_rate: m/s, heading: deg.
       timestamp: integer seconds.
+
+    IMPORTANT:
+    - timestamp progression is now consistent with dt_s
     """
     rng = np.random.default_rng(seed)
     t0 = 1700000000
@@ -39,7 +42,7 @@ def generate_aircraft_data(
         climb_rate = float(rng.normal(0.0, 0.5))  # m/s
 
         for k in range(time_steps):
-            ts = t0 + k
+            ts = t0 + int(round(k * dt_s))
 
             rows.append({
                 "icao": icao,
@@ -91,7 +94,9 @@ def inject_gps_spoofing_attack(
     lon_shift: float = 0.10,
 ) -> pd.DataFrame:
     """
-    Spoofing = persistent bias in position with unchanged velocity/heading.
+    Spoofing = progressive drift in reported position with unchanged velocity/heading.
+    The offset ramps across the attack window so the displayed track is gradually
+    pulled away from the legitimate route instead of behaving like a single jump.
     """
     d = df.copy()
     m = (d["icao"].astype(str) == str(target_icao))
@@ -103,8 +108,12 @@ def inject_gps_spoofing_attack(
     end_step = max(start_step, min(end_step, len(idx) - 1))
 
     attack_idx = idx[start_step:end_step + 1]
-    d.loc[attack_idx, "latitude"] = d.loc[attack_idx, "latitude"] + float(lat_shift)
-    d.loc[attack_idx, "longitude"] = d.loc[attack_idx, "longitude"] + float(lon_shift)
+    if not attack_idx:
+        return d
+
+    ramp = np.linspace(0.0, 1.0, num=len(attack_idx), endpoint=True, dtype=float)
+    d.loc[attack_idx, "latitude"] = d.loc[attack_idx, "latitude"].to_numpy(dtype=float) + ramp * float(lat_shift)
+    d.loc[attack_idx, "longitude"] = d.loc[attack_idx, "longitude"].to_numpy(dtype=float) + ramp * float(lon_shift)
     return d
 
 

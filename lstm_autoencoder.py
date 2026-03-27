@@ -96,7 +96,7 @@ class LSTMAutoencoder(nn.Module):
         for (batch,) in dl:
             recon = self.forward(batch)
             # per-sequence mean squared error over (T,F)
-            e = torch.mean((recon - batch) ** 2, dim=(1, 2))
+            e = torch.mean((recon - batch) ** 2, dim=(1, 2)) 
             errs.append(e.detach().cpu().numpy())
 
         return np.concatenate(errs, axis=0) if errs else np.zeros((0,), dtype=np.float32)

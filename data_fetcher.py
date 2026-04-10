@@ -74,6 +74,7 @@ def fetch_live_adsb_data(
             "velocity", "true_track", "vertical_rate", "sensors",
             "geo_altitude", "squawk", "spi", "position_source"
         ]
+        
 
         rows = []
         for s in states:
